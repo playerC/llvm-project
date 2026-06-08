@@ -1119,8 +1119,181 @@ static void inferFinalNewline(llvm::Expected<size_t> &Err,
   Err = Contents.size();
 }
 
+#define UTF8_M1 (0x80)
+#define UTF8_S1 (0x00)
+
+#define UTF8_M2 (0XE0)
+#define UTF8_S2 (0xC0)
+
+#define UTF8_M3 (0xF0)
+#define UTF8_S3 (0xE0)
+
+#define UTF8_M4 (0xF8)
+#define UTF8_S4 (0xF0)
+
+#define UTF_MATCH(v, n)                                                        \
+  if (((v) & (UTF8_M##n)) == (UTF8_S##n))                                      \
+  return (n)
+
+static int stepNextUtf8(std::string &txt, size_t StartIndex) {
+  const unsigned char sc = txt[StartIndex];
+  UTF_MATCH(sc, 1);
+  UTF_MATCH(sc, 2);
+  UTF_MATCH(sc, 3);
+  UTF_MATCH(sc, 4);
+  return -1;
+}
+
+// Inside clangd using Utf-8 to manage the txt contents. but client
+// side can use diferent encoding.
+//
+// This function is used to align the codepoint with client.
+//
+// - CodeUnit , is the client side CodeUnit using OffsetEncoding .
+//
+// return the utf8 byte count ,that have same codepoint with client.
+//
+static size_t convertToUTF8Offset(std::string &UTF8Txt, size_t StartIndex,
+                                  size_t CodeUnits,
+                                  OffsetEncoding clientEncoding, bool &Valid) {
+
+  int utf8Step = 0;
+
+  Valid = true;
+
+  switch (clientEncoding) {
+  case OffsetEncoding::UTF8:
+    return StartIndex + CodeUnits;
+    break;
+  case OffsetEncoding::UTF16:
+    // UTF-8 :1 ,2, 3 , 4
+    // UTF16: 1  1  1   2
+    // 1+ (n>>2)
+    for (; Valid && CodeUnits > 0;) {
+      utf8Step = stepNextUtf8(UTF8Txt, StartIndex);
+      if (utf8Step < 1) {
+        Valid = false;
+        break;
+      }
+      CodeUnits -= (1 + (utf8Step >> 2));
+      StartIndex += utf8Step;
+    }
+    break;
+  case OffsetEncoding::UTF32:
+    // 1.
+    for (; Valid && CodeUnits > 0;) {
+      utf8Step = stepNextUtf8(UTF8Txt, StartIndex);
+      if (utf8Step < 1) {
+        Valid = false;
+        break;
+      }
+      --CodeUnits;
+      StartIndex += utf8Step;
+    }
+    break;
+  }
+
+  return StartIndex;
+}
+
 llvm::Error applyChange(std::string &Contents,
                         const TextDocumentContentChangeEvent &Change) {
+  if (!Change.range) {
+    Contents = Change.text;
+    return llvm::Error::success();
+  }
+
+  const Position &Start = Change.range->start;
+  const Position &End = Change.range->end;
+
+  if (Start.line < 0) {
+    return error(llvm::errc::invalid_argument,
+                 "Start.line can not less than 0");
+  }
+  if (Start.character < 0) {
+    return error(llvm::errc::invalid_argument,
+                 "Start.character can not less than 0");
+  }
+
+  if (End.line < 0) {
+    return error(llvm::errc::invalid_argument, "End.line can not less than 0");
+  }
+
+  if (End.character < 0) {
+    return error(llvm::errc::invalid_argument,
+                 "End.character can not less than 0");
+  }
+
+  if (End.line < Start.line) {
+    return error(llvm::errc::invalid_argument,
+                 "End.line can not less than Start.line");
+  }
+
+  // `xxxx\n` , means 2 line.
+  // `xxx` , means 1 line.
+  // lineNum count from 0;
+  size_t contentsLineCount = llvm::count(Contents, '\n');
+  if (End.line > contentsLineCount) {
+    return error(llvm::errc::invalid_argument,
+                 "End.line:[{0}] can not bigger than ContentsLineCount:[{1}]",
+                 End.line, contentsLineCount);
+  }
+
+  size_t startLineIndex = 0;
+  size_t endLineIndex = 0;
+
+  {
+    size_t currentLineNum = 0;
+    size_t nextLineIndex = 0;
+    for (; currentLineNum != Start.line; ++currentLineNum) {
+      nextLineIndex = Contents.find('\n', nextLineIndex);
+      ++nextLineIndex;
+    }
+    startLineIndex = nextLineIndex;
+
+    for (; currentLineNum != End.line; ++currentLineNum) {
+      nextLineIndex = Contents.find('\n', nextLineIndex);
+      ++nextLineIndex;
+    }
+    endLineIndex = nextLineIndex;
+  }
+
+  size_t contentsLength = Contents.length();
+
+  if ((endLineIndex + End.character) > contentsLength) {
+    return error(llvm::errc::invalid_argument, "End.character too large.");
+  }
+
+  if ((startLineIndex + Start.character) > (endLineIndex + End.character)) {
+    return error(llvm::errc::invalid_argument,
+                 "Start postion cant not after than End position.");
+  }
+
+  size_t startOffset = 0;
+  size_t endOffset = 0;
+
+  bool valid;
+  startOffset = convertToUTF8Offset(Contents, startLineIndex, Start.character,
+                                    lspEncoding(), valid);
+  if (!valid) {
+    return error(llvm::errc::invalid_argument,
+                 "Start.character:[{0}] is invalid.", Start.character);
+  }
+
+  endOffset = convertToUTF8Offset(Contents, endLineIndex, End.character,
+                                  lspEncoding(), valid);
+  if (!valid) {
+    return error(llvm::errc::invalid_argument,
+                 "End.character:[{0}] is invalid.", End.character);
+  }
+
+  Contents.replace(startOffset, endOffset - startOffset, Change.text);
+
+  return llvm::Error::success();
+}
+
+llvm::Error applyChange_slow(std::string &Contents,
+                             const TextDocumentContentChangeEvent &Change) {
   if (!Change.range) {
     Contents = Change.text;
     return llvm::Error::success();
